@@ -4,40 +4,107 @@ use clap::{Parser, Subcommand};
 use reqwest::Error;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+const NAME: &str = "hassctl";
 const ACCESS_TOKEN_KEY: &str = "HASSCTL_ACCESS_TOKEN";
 const PORT_KEY: &str = "HASSCTL_PORT";
+const DEFAULT_PORT: u16 = 8123;
 const HOST_KEY: &str = "HASSCTL_HOST";
 
-fn request<T: DeserializeOwned>(path: &str) -> Result<T, Error> {
-    let access_token = env::var(ACCESS_TOKEN_KEY).unwrap();
-    let host = env::var(HOST_KEY).unwrap();
-    let port = env::var(PORT_KEY).unwrap();
-    let url = format!("http://{}:{}{}", host, port, path);
-    let client = reqwest::blocking::Client::new();
-    let response = client.get(url).bearer_auth(access_token).send();
-    match response {
-        Ok(res) => {
-            // println!("TEXT: {:?}", res.text());
-            res.json::<T>()
+struct Client {
+    access_token: String,
+    port: u16,
+    host: String,
+}
+
+enum ClientError {
+    MissingAccessToken,
+    InvalidAccessToken,
+    MissingHost,
+    InvalidHost,
+    InvalidPort,
+}
+
+impl ClientError {
+    fn error_description(&self) -> String {
+        match self {
+            ClientError::MissingAccessToken => format!(
+                "Missing access token\n\
+                \n\
+                To authenticate requests to Home Assistant, {}\n\
+                needs to have an access token.\n\
+                \n\
+                Go to your profile in the Home Assistant dashboard,\n\
+                and select the Security tab. Create a long-lived token,\n\
+                and make sure to copy the token.\n\
+                \n\
+                Then create an environment variable named {}\n\
+                with the access token as value.",
+                NAME, ACCESS_TOKEN_KEY
+            ),
+            ClientError::InvalidAccessToken => "Invalid access token!".into(),
+            ClientError::MissingHost => "Missing host.".into(),
+            ClientError::InvalidHost => "Invalid host.".into(),
+            ClientError::InvalidPort => "Invalid port.".into(),
         }
-        Err(err) => Err(err),
     }
 }
 
-fn post_request<T: Serialize, R: DeserializeOwned>(path: &str, payload: &T) -> Result<R, Error> {
-    let access_token = env::var(ACCESS_TOKEN_KEY).unwrap();
-    let host = env::var(HOST_KEY).unwrap();
-    let port = env::var(PORT_KEY).unwrap();
-    let url = format!("http://{}:{}{}", host, port, path);
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(url)
-        .bearer_auth(access_token)
-        .json(payload)
-        .send();
-    match response {
-        Ok(res) => res.json::<R>(),
-        Err(err) => Err(err),
+impl Client {
+    fn setup() -> Result<Self, ClientError> {
+        let access_token = match env::var(ACCESS_TOKEN_KEY) {
+            Ok(s) => s,
+            Err(env::VarError::NotPresent) => return Err(ClientError::MissingAccessToken),
+            Err(_) => return Err(ClientError::InvalidAccessToken),
+        };
+
+        let host = match env::var(HOST_KEY) {
+            Ok(s) => s,
+            Err(env::VarError::NotPresent) => return Err(ClientError::MissingHost),
+            Err(_) => return Err(ClientError::InvalidHost),
+        };
+
+        let port = match env::var(PORT_KEY) {
+            Ok(s) => match s.parse::<u16>() {
+                Ok(v) => v,
+                Err(_) => return Err(ClientError::InvalidPort),
+            },
+            Err(env::VarError::NotPresent) => DEFAULT_PORT,
+            Err(_) => return Err(ClientError::InvalidPort),
+        };
+
+        Ok(Self {
+            access_token,
+            host,
+            port,
+        })
+    }
+
+    fn build_url(&self, path: &str) -> String {
+        format!("http://{}:{}{}", self.host, self.port, path)
+    }
+
+    fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
+        let url = self.build_url(path);
+        let client = reqwest::blocking::Client::new();
+        let response = client.get(url).bearer_auth(&self.access_token).send();
+        match response {
+            Ok(res) => res.json::<T>(),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn post<T: Serialize, R: DeserializeOwned>(&self, path: &str, payload: &T) -> Result<R, Error> {
+        let url = self.build_url(path);
+        let client = reqwest::blocking::Client::new();
+        let response = client
+            .post(url)
+            .bearer_auth(&self.access_token)
+            .json(payload)
+            .send();
+        match response {
+            Ok(res) => res.json::<R>(),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -45,7 +112,7 @@ fn post_request<T: Serialize, R: DeserializeOwned>(path: &str, payload: &T) -> R
 struct StateDto {
     attributes: HashMap<String, serde_json::Value>,
     entity_id: String,
-    last_changed: String,
+    // last_changed: String,
     state: String,
 }
 
@@ -66,8 +133,8 @@ impl StateDto {
     }
 }
 
-fn cmd_scene_list() {
-    match request::<Vec<StateDto>>("/api/states") {
+fn cmd_scene_list(client: &Client) {
+    match client.get::<Vec<StateDto>>("/api/states") {
         Ok(list) => {
             let scenes: Vec<StateDto> = list
                 .into_iter()
@@ -99,10 +166,10 @@ struct ServiceDataDto {
     entity_id: String,
 }
 
-fn cmd_scene_enable(entity_id: String) {
+fn cmd_scene_enable(client: &Client, entity_id: String) {
     let payload = ServiceDataDto { entity_id };
 
-    match post_request::<ServiceDataDto, Vec<StateDto>>("/api/services/scene/turn_on", &payload) {
+    match client.post::<ServiceDataDto, Vec<StateDto>>("/api/services/scene/turn_on", &payload) {
         Ok(_) => println!("Scene enabled."),
         Err(_) => println!("Failed to enable scene."),
     }
@@ -135,11 +202,19 @@ enum SceneCommands {
 fn main() {
     let cli = Cli::parse();
 
+    let client = match Client::setup() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Failed to create client:\n\n{}", e.error_description());
+            return;
+        }
+    };
+
     match &cli.command {
         Commands::Scene(scene_cli) => match &scene_cli.command {
-            SceneCommands::List => cmd_scene_list(),
+            SceneCommands::List => cmd_scene_list(&client),
             SceneCommands::Show => todo!(),
-            SceneCommands::Enable { entity_id } => cmd_scene_enable(entity_id.clone()),
+            SceneCommands::Enable { entity_id } => cmd_scene_enable(&client, entity_id.clone()),
         },
     }
 }
