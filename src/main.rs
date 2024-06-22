@@ -42,7 +42,13 @@ impl ClientError {
                 NAME, ACCESS_TOKEN_KEY
             ),
             ClientError::InvalidAccessToken => "Invalid access token!".into(),
-            ClientError::MissingHost => "Missing host.".into(),
+            ClientError::MissingHost => format!(
+                "Missing host.\n\
+                \n\
+                Host must be specified in the environment variable {}.\n",
+                HOST_KEY
+            )
+            .into(),
             ClientError::InvalidHost => "Invalid host.".into(),
             ClientError::InvalidPort => "Invalid port.".into(),
         }
@@ -53,7 +59,10 @@ impl Client {
     fn setup() -> Result<Self, ClientError> {
         let access_token = match env::var(ACCESS_TOKEN_KEY) {
             Ok(s) => s,
-            Err(env::VarError::NotPresent) => return Err(ClientError::MissingAccessToken),
+            Err(env::VarError::NotPresent) => match dotenv::var(ACCESS_TOKEN_KEY) {
+                Ok(s) => s,
+                Err(_) => return Err(ClientError::MissingAccessToken),
+            },
             Err(_) => return Err(ClientError::InvalidAccessToken),
         };
 
@@ -200,6 +209,7 @@ enum SceneCommands {
 }
 
 fn main() {
+    dotenv::dotenv().ok();
     let cli = Cli::parse();
 
     let client = match Client::setup() {
